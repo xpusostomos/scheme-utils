@@ -1,0 +1,159 @@
+#!/usr/bin/guile -s
+!#
+;;; repl -- talk to a running program, whichever program it is.
+;;;
+;;;   repl                  what has a back door open, and whether it answers
+;;;   repl NAME             an interactive session with NAME
+;;;   repl -e EXPR NAME     evaluate EXPR once, print the answer, and exit
+;;;   repl -p PATH          an interactive session on an explicit socket
+;;;   repl -e EXPR -p PATH  the same, one-shot, on an explicit socket
+;;;
+;;; NAME is the INSTANCE, not the program: `repl scheme-desktop' finds the shell
+;;; wherever it published itself, and `repl schemacs' finds the editor.  How it
+;;; finds them is `(scheme-utils repl client)''s business -- two transports, and
+;;; a search for each -- and is documented there.
+;;;
+;;; THE EXIT STATUS IS THE POINT for `-e': 0 when the expression produced a
+;;; value, 1 when the program reported an error, 2 when there was nothing to
+;;; connect to.  A script that drives a running program with `repl -e' needs to
+;;; tell those apart, and the answer text alone cannot say which happened.
+;;;
+;;; WHY THIS IS A SCRIPT AND NOT A `guile -c' ONE-LINER: a shell wrapper would
+;;; have to quote Scheme inside shell strings, which goes wrong immediately, and
+;;; this is a real program with argument handling in it.
+
+;; THE LOCAL SITE DIRECTORY, ADDED BY HAND, AND AT EXPAND TIME.  Guile does not
+;; search ~/.local/share/guile/site/<version> -- measured, the default %load-path
+;; has nothing under $HOME -- so a module installed with `make install-local' is
+;; invisible until something puts it on the path.
+;;
+;; `eval-when (expand ...)' AND NOT A PLAIN `set!'.  A script run with `-s' is
+;; COMPILED before it is run, and the compiler resolves `use-modules' during
+;; expansion -- so a plain `set!' has not happened yet, the module cannot be
+;; found, and Guile abandons the compilation and interprets the file instead.
+;; The visible symptom is a WARNING on every run and a script that works anyway,
+;; which is the kind of thing that gets left in.
+(eval-when (expand load eval)
+  (set! %load-path
+        (cons (string-append (or (getenv "XDG_DATA_HOME")
+                                 (string-append (or (getenv "HOME") "") "/.local/share"))
+                             "/guile/site/" (effective-version))
+              %load-path)))
+
+(use-modules (scheme-utils repl client))
+(use-modules (ice-9 format))
+
+(define (die fmt . args)
+  "Say what went wrong on stderr and exit 2 -- nothing to connect to."
+  (apply format (current-error-port) (string-append "repl: " fmt "\n") args)
+  (exit 2))
+
+(define (usage)
+  (format #t "repl -- talk to a running program~%~%")
+  (format #t "  repl                  what has a back door open~%")
+  (format #t "  repl NAME             an interactive session with NAME~%")
+  (format #t "  repl -e EXPR NAME     evaluate EXPR once and print the answer~%")
+  (format #t "  repl -p PATH          a session on an explicit socket path~%")
+  (format #t "  repl -l               the same as no arguments~%")
+  0)
+
+;;; ---------------------------------------------------------------------------
+;;; Connecting
+;;; ---------------------------------------------------------------------------
+
+(define (connect-or-die name)
+  "A socket to NAME, or a report and exit 2."
+  (or (repl-connect-to name)
+      (die "nothing is answering for ~a~%  (try `repl' to see what is)" name)))
+
+(define (greet-or-die socket name)
+  "The greeting SOCKET sends, consuming it, or a report and exit 2.
+
+THE CHECK IS NOT DECORATION: it is what stops this hanging.  A program that is
+not a Guile REPL may accept the connection and then say nothing, and reading
+until a prompt waits for ever.  The runtime directory holds sockets that are
+nothing to do with this -- colorshell publishes one -- so a name typed by hand
+can land on any of them."
+  (or (repl-greeting socket)
+      (begin (repl-close socket)
+             (die "~a does not answer like a Guile back door.~%  (try `repl' to see what does)"
+                  name))))
+
+;;; ---------------------------------------------------------------------------
+;;; The three things it does
+;;; ---------------------------------------------------------------------------
+
+(define (do-list)
+  (repl-list)
+  0)
+
+(define (do-eval name expression)
+  (let* ((socket (connect-or-die name))
+         (banner (greet-or-die socket name)))
+    (repl-send socket expression)
+    (let ((answer (repl-read-to-prompt socket)))
+      (repl-close socket)
+      (cond
+       ((not answer)
+        (format (current-error-port) "repl: the program closed the connection~%")
+        1)
+       ((repl-answer-error? answer)
+        (format (current-error-port) "~a~%" (repl-answer-text answer))
+        1)
+       (else
+        (let ((text (repl-answer-text answer)))
+          (unless (string=? text "")
+            (format #t "~a~%" text)))
+        0)))))
+
+(define (do-session name)
+  (let* ((socket (connect-or-die name))
+         ;; THE GREETING IS PRINTED HERE, because `repl-run-session' copies what
+         ;; the program says from now on and the greeting has already been read
+         ;; to check it.  A user expects to see the prompt they are talking to.
+         (banner (greet-or-die socket name)))
+    (display banner)
+    (force-output)
+    (repl-run-session socket)
+    0))
+
+;;; ---------------------------------------------------------------------------
+;;; Arguments
+;;; ---------------------------------------------------------------------------
+
+(define (main argv)
+  (let loop ((rest (cdr argv)) (expression #f) (path #f))
+    (cond
+     ((null? rest)
+      (cond (expression (do-eval (or path (die "no NAME and no -p PATH"))
+                                 expression))
+            (path (do-session path))
+            (else (do-list))))
+     ((string=? (car rest) "-h")
+      (usage))
+     ((string=? (car rest) "--help")
+      (usage))
+     ((string=? (car rest) "-l")
+      (do-list))
+     ;; `list' AS A WORD, because that is what a person types, and because an
+     ;; instance CALLED list would be a name this tool cannot serve -- the
+     ;; convention is that a bare word names a program, so the word has to be
+     ;; taken, and saying so is better than a puzzling "nothing is answering for
+     ;; list".  `-l' is the unambiguous form for a script.
+     ((string=? (car rest) "list")
+      (do-list))
+     ((string=? (car rest) "-e")
+      (if (null? (cdr rest))
+          (die "-e needs an expression")
+          (loop (cddr rest) (cadr rest) path)))
+     ((string=? (car rest) "-p")
+      (if (null? (cdr rest))
+          (die "-p needs a socket path")
+          (loop (cddr rest) expression (cadr rest))))
+     (else
+      ;; THE LAST BARE WORD IS THE NAME, and there is only one.
+      (if path
+          (die "unexpected extra argument: ~a" (car rest))
+          (loop (cdr rest) expression (car rest)))))))
+
+(exit (main (command-line)))

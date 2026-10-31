@@ -59,8 +59,17 @@ MANPAGES := $(wildcard man/*.1)
 # bin/ holds launchers, installed as they stand.
 
 DIRS    := scheme-utils
-SCRIPTS :=
-MODULES := $(filter-out $(SCRIPTS),$(wildcard $(addsuffix /*.scm,$(DIRS))))
+# bin/ holds PROGRAMS, not modules: a file with no define-module is a script and
+# is installed as one.  Listed explicitly rather than discovered, because a
+# script that is silently not installed looks exactly like one that works.
+SCRIPTS := bin/repl
+# `find', NOT `$(wildcard $(DIRS)/*.scm)'.  A module's path IS its name, so
+# `(scheme-utils repl server)' lives one directory down -- and a wildcard of one
+# level MISSED it silently: the module loaded (Guile compiles from source when it
+# has no .go), `make test' passed, and only `make install' was wrong, shipping a
+# site-ccache with no entry for three modules.  Same list SOURCES is built from,
+# for the same reason.
+MODULES := $(filter-out $(SCRIPTS),$(shell find $(DIRS) -name '*.scm' ! -name '*~'))
 GOS     := $(patsubst %.scm,build/%.go,$(MODULES))
 
 # What gets installed from the tree: every file under $(DIRS) except editor
@@ -97,6 +106,7 @@ install: all
 	rm -rf $(DESTDIR)$(CCACHEDIR)/scheme-utils
 	for f in $(SOURCES); do install -D -m 644 $$f $(DESTDIR)$(SITEDIR)/$$f; done
 	cp -r build/scheme-utils $(DESTDIR)$(CCACHEDIR)/
+	install -D -m 755 bin/repl $(DESTDIR)$(BINDIR)/repl
 
 # A local install carries no .go: Guile compiles into the user's own cache the
 # first time it loads a module.  Slower once, then the same as an install, and
@@ -120,6 +130,7 @@ install-local:
 	install -d $(LOCALSITEDIR)
 	rm -rf $(LOCALSITEDIR)/scheme-utils
 	for f in $(SOURCES); do install -D -m 644 $$f $(LOCALSITEDIR)/$$f; done
+	install -D -m 755 bin/repl $(LOCALBINDIR)/repl
 
 # uninstall removes what install put there: the site tree, its ccache, the
 # launcher, and the manual page.  It does NOT touch the auto-compile cache,
@@ -132,6 +143,7 @@ install-local:
 uninstall:
 	rm -rf $(DESTDIR)$(SITEDIR)/scheme-utils
 	rm -rf $(DESTDIR)$(CCACHEDIR)/scheme-utils
+	rm -f $(DESTDIR)$(BINDIR)/repl
 
 # A local install ships no .go: Guile compiles those sources into the user's
 # OWN cache the first time it loads them.  That cache is keyed by the absolute
@@ -140,6 +152,7 @@ uninstall:
 # LOCALSITEDIR would otherwise make the pattern match every cached tree.)
 uninstall-local:
 	rm -rf $(LOCALSITEDIR)/scheme-utils
+	rm -f $(LOCALBINDIR)/repl
 	@if [ -n "$(LOCALSITEDIR)" ]; then \
 	   rm -rf $(CACHEHOME)/guile/ccache/*$(LOCALSITEDIR); \
 	 fi
