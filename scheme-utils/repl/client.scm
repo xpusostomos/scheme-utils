@@ -537,15 +537,23 @@ Raising is the default because an expression that failed is normally a mistake
 the caller wants to hear about -- but a caller iterating over many expressions
 may want to carry on, and that is what the other value is for."
   (let ((socket (repl-open-session path)))
-    (catch #t
+    ;; **THE SOCKET IS CLOSED EITHER WAY, AND THAT IS NOT TIDINESS.** A program
+    ;; serves ONE client session at a time, and a session nobody closes leaves
+    ;; its reader parked on it -- so the next client is accepted, and then never
+    ;; greeted: `repl -e' reports "nothing is answering for NAME" and exits 2,
+    ;; and a session client hangs with no banner at all. Measured, the day
+    ;; `se --remote FILE' was followed by `se --repl' against the same program.
+    ;; (The socket does close when the port is collected, so this is a race
+    ;; rather than a certainty, which is exactly what makes it worth closing
+    ;; here as one.)
+    (dynamic-wind
+      (lambda () #f)
       (lambda ()
         (let-values (((text failed) (repl-eval-values socket expression)))
           (when (and failed (eq? on-error 'raise))
             (error "the program reported an error:" text))
           text))
-      (lambda args
-        (repl-close socket)
-        (apply throw args)))))
+      (lambda () (repl-close socket)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Being a REPL for it
