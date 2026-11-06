@@ -20,10 +20,31 @@
 ;;    every event in the batch is collected first; the reload decision is made
 ;;    ONCE for the batch. Ten events from one save are one reload, not ten.
 ;;
+;; 3. THE LOADER SAYS WHAT IT LOADED, and this module does not guess.  The list
+;;    of watched files is exactly the files `auto-load' read, reported one at a
+;;    time through `auto--watch-note-loaded!'.
+;;
+;;    UPSTREAM DID THIS WITH `%load-hook', AND THAT IS THE ONE PLACE THIS FILE
+;;    DELIBERATELY PARTS COMPANY WITH IT.  The hook is global: it fires for
+;;    EVERY file the process loads, whoever asked.  Its comment claimed that
+;;    meant "the files a CONFIG chose to read, and none of the machinery's own
+;;    modules" -- but the shell's own modules are loaded by name, and a file
+;;    pulled in by `user-load-config' is loaded from inside a LOADED FILE, so
+;;    the claim was wrong in both directions at once.  Measured, in
+;;    scheme-desktop: the moment anything is evaluated over the REPL, Guile
+;;    compiles it, which loads its compiler sources, which the hook reported --
+;;    60 files from /usr/share/guile/3.0/language/ in the watch list, each with
+;;    a directory watch, none of them anything a config asked for.  It also
+;;    meant interposing on `%load-hook' for the whole process, which is not
+;;    this module's to take.
+;;
+;;    The loader knows what it read.  Asking it is exact, and needs no hook.
+;;
 ;; THE LOADER IS NOT HERE.  `auto-load' and `auto-load-config' live in
-;; (scheme-utils load), which is the module that reads files; this one only
-;; watches the ones that were read.  They were published from here too, and a
-;; name exported by two modules is a name whose errors land in the wrong file.
+;; (scheme-utils load), which is the module that reads files -- and which
+;; therefore imports this one to report them.  They were published from here
+;; too, and a name exported by two modules is a name whose errors land in the
+;; wrong file.
 
 (define-module (scheme-utils watch)
   ;; auto-loaded-files is the only part of this module that is API. Everything
@@ -43,7 +64,7 @@
             ;; internals, exported because every top-level define here is --
             ;; upstream's convention, kept so a forgotten export is visible
             auto--watch-loaded auto--watch-dirs auto--watch-fd
-            auto--watch-recording? auto--watch-waiter-armed?
+            auto--watch-waiter-armed?
             auto--watch-canonical auto--watch-join
             auto--watch-dir-watched? auto--watch-dir-of-wd
             auto--watch-dir! auto--watch-note-loaded!
@@ -82,12 +103,6 @@
 (define auto--watch-dirs '())
 
 (define auto--watch-fd #f)
-;; Whether a file being loaded is the CONFIG's or the host's.  Off until
-;; `auto-watch-start!': this module is imported by a program's own module graph,
-;; so the program's modules load after it, and recording those would fill the
-;; watch list with the source tree instead of the config.  Measured in
-;; scheme-desktop: 17 source files were recorded before the config was read.
-(define auto--watch-recording? #f)
 
 (define (auto-loaded-files)
   "The files the running config has loaded, most recent first. These are the
@@ -139,13 +154,24 @@
         (set! auto--watch-dirs (acons dir wd auto--watch-dirs))))))
 
 (define (auto--watch-note-loaded! path)
-  (let ((full (auto--watch-canonical path)))
-    (unless (member full auto--watch-loaded)
-      (set! auto--watch-loaded (cons full auto--watch-loaded))
-      ;; Watching the DIRECTORY, not the file: a file watch follows the inode,
-      ;; so an editor that saves by renaming a temp file over the target would
-      ;; leave us watching something nobody will ever write to again.
-      (auto--watch-dir! (dirname full)))))
+  "Record PATH as a file to reload on, and start watching its directory.
+
+CALLED BY THE LOADER, once per file `auto-load' reads -- so the list is exactly
+the files a config asked for, and never anything else the process happens to
+load.  See the note at the top for why this is not `%load-hook'.
+
+NOTHING IS RECORDED BEFORE `auto-watch-start!', and that is the whole of the
+guard: an unarmed watcher has no fd to add a directory watch to, and a file
+loaded before the host armed it was loaded by the host, not by the config the
+host is about to read."
+  (when (auto-watch-armed?)
+    (let ((full (auto--watch-canonical path)))
+      (unless (member full auto--watch-loaded)
+        (set! auto--watch-loaded (cons full auto--watch-loaded))
+        ;; Watching the DIRECTORY, not the file: a file watch follows the inode,
+        ;; so an editor that saves by renaming a temp file over the target would
+        ;; leave us watching something nobody will ever write to again.
+        (auto--watch-dir! (dirname full))))))
 
 ;; ---- the event ---------------------------------------------------------------
 (define (auto--watch-interesting? mask)
@@ -299,37 +325,26 @@ that does the resolving -- one fact, in the module that owns it."
   (and auto--watch-fd auto--watch-waiter-armed? #t))
 
 (define (auto-watch-start!)
-  "Open the inotify fd, hand it to the waiter, and start recording loads.
+  "Open the inotify fd and hand it to the waiter.
 
-Called by the host once, after `auto-watch-waiter!' and `auto-watch-configure!'.
-Anything the config loads AFTER this is a file the config asked for; see the
-note on the hook below for why that matters."
+Called by the host once, after `auto-watch-waiter!' and `auto-watch-configure!',
+and before it loads anything.  This is what makes the watcher ARMED, and an
+unarmed watcher records nothing: a file loaded before this point was loaded by
+the host rather than by the config, and there is no fd to watch its directory
+with."
   (unless %waiter
     (error "auto-watch-start!: call auto-watch-waiter! first"))
   (unless auto--watch-fd
     (set! auto--watch-fd (inotify-init1 (logior IN-NONBLOCK IN-CLOEXEC)))
     (set! auto--watch-waiter-armed?
           (%waiter auto--watch-fd (lambda () (auto--watch-on-readable)))))
-  (set! auto--watch-recording? #t)
   #t)
 
-;; %load-hook is Guile's own "a file is being loaded" notification. It fires for
-;; load / load-from-path / primitive-load and does NOT fire for use-modules —
-;; exactly the right set: the files a CONFIG chose to read, and none of the
-;; machinery's own modules, which are loaded by name on the first generation.
-;;
-;; The hook that was there is CALLED THROUGH rather than replaced: Guile's
-;; default is %load-announce, and dropping someone else's behaviour is not this
-;; hook's business. Guarded, because it runs inside Guile's loader: a bad path
-;; must never take a load down.
-(set! %load-hook
-  (let ((previous %load-hook))
-    (lambda (file)
-      (when (procedure? previous)
-        (previous file))
-      (guard (e (#t #f))
-        (when (and auto--watch-fd auto--watch-recording?)
-          (auto--watch-note-loaded! file))))))
+;; NO %load-hook, AND NOTHING IS SET AT LOAD TIME.  This file defines procedures
+;; and interposes on nothing: Guile's own `%load-hook' is left exactly as Guile
+;; set it, and the list of watched files is built from what `auto-load' reports.
+;; Upstream replaced `%load-hook' process-wide, which is what pulled Guile's own
+;; compiler sources into the watch list; see the note at the top.
 
 ;; ---- one reload per save, and only for a real change -------------------------
 ;;
@@ -421,7 +436,6 @@ carry the previous run's paths -- which would be watched again for nothing."
     (catch #t (lambda () (inotify-close auto--watch-fd)) (lambda args #f)))
   (set! auto--watch-fd #f)
   (set! auto--watch-waiter-armed? #f)
-  (set! auto--watch-recording? #f)
   (set! auto--watch-loaded '())
   (set! auto--watch-dirs '())
   (hash-clear! auto--watch-seen)

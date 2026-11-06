@@ -13,9 +13,10 @@
 ;;;   - A config that pulls in a file by name wants the file looked up where a
 ;;;     config lives, and that is per program.
 ;;;   - Nothing in Guile reports WHICH files a config loaded, and the watcher
-;;;     needs exactly that.  `primitive-load` goes through `%load-hook`, so
-;;;     (scheme-utils watch) hears about every file this module reads without
-;;;     being told.  (That is also why nothing here calls the watcher.)
+;;;     needs exactly that -- so this module says so, one file at a time, and
+;;;     the watcher watches what it is told and guesses at nothing else.  (It
+;;;     is the only module here that imports (scheme-utils watch); the
+;;;     dependency runs one way.)
 ;;;
 ;;; THE TARGET MODULE IS THE CALLER'S.  Upstream loads into "the current
 ;;; generation", which its host owns.  Here it is whatever `auto-load-module!`
@@ -30,6 +31,10 @@
 ;;; and saw nothing happen.
 
 (define-module (scheme-utils load)
+  ;; To REPORT what was read, which is the whole of the watcher's input.  See
+  ;; `auto-load' below: upstream got this from `%load-hook', which fires for
+  ;; every file the process loads.  The loader is exact where the hook is not.
+  #:use-module (scheme-utils watch)
   #:use-module (ice-9 format)
   #:use-module (ice-9 optargs)
   #:export (auto-load-module! auto-load-module
@@ -83,6 +88,12 @@ is REPORTED and does not stop the rest of the config -- but it IS a failure here
 and this answers #f for it, which is what lets `auto-load-config' tell a file
 that died halfway through from one that loaded."
 
+  ;; REPORTED BEFORE IT IS EVALUATED, and the order is the point.  A file with a
+  ;; syntax error must still be watched: fixing it is the one edit a user is
+  ;; certain to make next, and a watcher told only about the loads that SUCCEEDED
+  ;; would sit there while they saved the fix and saw nothing happen.  (This is
+  ;; also why the old hook, which fired as a load began, had it right.)
+  (auto--watch-note-loaded! path)
   (catch #t
     (lambda ()
       (save-module-excursion

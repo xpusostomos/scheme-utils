@@ -279,7 +279,7 @@ string, which is a path for a Unix socket and \"host:port\" for a TCP one."
   "The names directly in DIR, or '() when it cannot be read."
   (catch #t (lambda () (scandir dir)) (lambda args '())))
 
-(define* (repl-greeting socket #:key (tries 120))
+(define* (repl-greeting socket #:key (tries 120) on-slow)
   "The banner SOCKET sends on connect, or #f when it is not a Guile REPL.
 
 CONSUMES IT, so the caller has it and the socket is ready for an expression.
@@ -292,8 +292,30 @@ does, so that string is the test.
 
 WAIT AND LOOK, RATHER THAN BLOCK.  A program that is not a REPL may accept the
 connection and then say nothing at all, and a client that read until a prompt
-would wait for ever on it.  Forty short turns is enough for a banner that is
-already in the socket buffer, which is where it is when the program IS a REPL.
+would wait for ever on it.
+
+**BUT THE WAIT IS NOT A HANG GUARD FOR A BACK DOOR -- IT IS THE PROTOCOL.**  A
+program's prompt is not written by the thread that ACCEPTS the connection: it is
+written by the program's MAIN thread when it next polls the cooperative server,
+because the main thread is the only one allowed to run a REPL (see
+`(scheme-utils repl coop-server)', `make-coop-client-proc').  So a program that
+is in the middle of a long expression, a redraw, or a garbage collection says
+nothing until it is done, and a client that gives up in a fraction of a second
+reports a perfectly healthy program as not being a Guile back door.
+
+Measured: with `(sleep 3)' being evaluated at one session's prompt, every other
+`repl' against the same program failed to greet for those three seconds and
+printed exactly that.  Hence TWO uses of this procedure, with two different
+`tries'.  The LISTING asks its question of every socket on the machine and must
+not linger over any of them, so its default is short.  A client that has been
+given ONE endpoint to talk to waits long enough to ride out real work, and
+ON-SLOW -- a thunk, called once at about a second -- is how it says so rather
+than looking hung.
+
+A FIRST BYTE THAT CANNOT BEGIN `scheme@` IS REFUSED AT ONCE.  Only silence is
+waited on, because silence is what a busy program looks like; a socket that says
+something else is not going to become a REPL by waiting, and the long wait is
+not spent on it.
 
 IT READS TO THE END OF THE PROMPT, and that is not a detail: stopping as soon as
 the text STARTS with `scheme@' leaves `(guile-user)> ' in the socket, and the
@@ -306,8 +328,27 @@ next read takes that for the beginning of the answer.  Measured -- the answer to
             ((>= n tries) #f)
             ((char-ready? socket)
              (let ((c (catch #t (lambda () (read-char socket)) (lambda args #f))))
-               (if (not c) #f (loop n (string-append seen (string c))))))
-            (else (usleep 5000) (loop (+ n 1) seen))))))
+               ;; EOF IS NOT A CHARACTER, and it is truthy, so it has to be
+               ;; tested for: a program that accepts and then CLOSES used to reach
+               ;; `(string c)' and die with a backtrace instead of answering #f.
+               (if (or (not c) (eof-object? c))
+                   #f
+                   (let ((more (string-append seen (string c))))
+                     ;; A GUILE REPL SAYS `scheme@' BEFORE ANYTHING ELSE, so the
+                     ;; first byte that disagrees with that word rules it out at
+                     ;; once -- `hello' is refused on its second character, not
+                     ;; after eight.  SILENCE still waits the full `tries',
+                     ;; because silence is what a busy program looks like; only a
+                     ;; socket that says something ELSE is refused early.
+                     (if (or (string-prefix? more "scheme@")
+                             (string-prefix? "scheme@" more))
+                         (loop n more)
+                         #f)))))
+            (else
+             ;; ONCE, at a second, and only when the caller asked for a wait
+             ;; long enough to have a second in it.
+             (when (and on-slow (= n 200)) (on-slow))
+             (usleep 5000) (loop (+ n 1) seen))))))
 
 (define* (repl-banner path #:key (tries 120))
   "The banner of whatever is at PATH, on a connection that is closed again.

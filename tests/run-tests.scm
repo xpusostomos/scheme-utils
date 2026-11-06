@@ -135,14 +135,30 @@
   (test-assert "start! opens the fd and reports it armed"
     (auto-watch-armed?))
 
-  ;; A file the loader reads is a file the watcher must know about, and it has to
-  ;; learn that without being told -- `primitive-load' goes through %load-hook.
-  ;; If this ever stops being true, every reload silently stops working, so it is
-  ;; the first thing pinned.
+  ;; A file the LOADER reads is a file the watcher must know about.  If this ever
+  ;; stops being true, every reload silently stops working, so it is the first
+  ;; thing pinned.
   (write-text (scratch "watched.scm") ";; version one\n")
   (auto-load (scratch "watched.scm"))
-  (test-assert "the loader reports what it read, through %load-hook"
+  (test-assert "the loader reports what it read"
     (member (scratch "watched.scm") (auto-loaded-files)))
+
+  ;; AND NOTHING ELSE IS REPORTED.  This is the regression test for the way the
+  ;; list used to be built: upstream took it from `%load-hook', which fires for
+  ;; every file the PROCESS loads, so the moment anything was evaluated over the
+  ;; REPL Guile compiled it -- and its compiler sources went into the watch list,
+  ;; 60 of them, none of them anything a config asked for.
+  ;;
+  ;; The directory IS watched either way, so an event for this file does arrive;
+  ;; what must not happen is the event matching anything.
+  (let ((baseline %reloads))
+    (write-text (scratch "by-hand.scm") ";; loaded by direct primitive-load\n")
+    (primitive-load (scratch "by-hand.scm"))
+    (test-assert "a file loaded by primitive-load is NOT recorded"
+      (not (member (scratch "by-hand.scm") (auto-loaded-files))))
+    (write-text (scratch "by-hand.scm") ";; and then changed\n")
+    (auto--watch-settle! 600)
+    (test-equal "so editing it does not reload" baseline %reloads))
 
   (let ((baseline %reloads))
     (write-text (scratch "watched.scm") ";; version two\n")
@@ -165,7 +181,7 @@
   (let ((baseline %reloads))
     (write-text (scratch "data.scm") "((a 1))\n")
     (auto--watch-begin! (scratch "data.scm"))
-    (test-assert "begin! adds a file the hook never saw"
+    (test-assert "begin! adds a file the loader never saw"
       (member (scratch "data.scm") (auto-loaded-files)))
     (write-text (scratch "data.scm") "((a 2))\n")
     (auto--watch-settle! 600)
@@ -175,6 +191,30 @@
     (and (auto-watch-stop!)
          (not (auto-watch-armed?))
          (null? (auto-loaded-files)))))
+
+;;; ---------------------------------------------------------------------------
+;;; the back door
+;;; ---------------------------------------------------------------------------
+;; LOADED rather than run as a second process: srfi-64 nests, so its assertions
+;; join this suite's total instead of printing another summary that `make test'
+;; would have to know how to read.  It is still a real file with its own
+;; test-begin and test-end, so it can be run on its own while debugging:
+;;
+;;   SCHEME_UTILS_TEST_DIR=/tmp/x guile -L . tests/repl.scm
+;;
+;; THE ENVIRONMENT IT NEEDS IS SET HERE, and it is the point of the variable:
+;; the suite puts its sockets in the scratch directory rather than in the user's
+;; XDG_RUNTIME_DIR.  A test that wrote there would leave sockets behind in the
+;; one directory they would be least welcome in.
+;;
+;; THE REAL XDG_RUNTIME_DIR IS LEFT ALONE apart from one assertion, which unsets
+;; it, checks the refusal, and puts it back -- see the last group.
+
+(setenv "SCHEME_UTILS_TEST_DIR" %scratch)
+;; "repl.scm", NOT "tests/repl.scm": Guile resolves a relative `load' against the
+;; directory of the file DOING the loading, so the longer path became
+;; "tests/tests/repl.scm" and the runner died with "Unable to find file".
+(load "repl.scm")
 
 ;;; ---------------------------------------------------------------------------
 

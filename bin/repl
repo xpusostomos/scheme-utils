@@ -73,10 +73,28 @@ THE CHECK IS NOT DECORATION: it is what stops this hanging.  A program that is
 not a Guile REPL may accept the connection and then say nothing, and reading
 until a prompt waits for ever.  The runtime directory holds sockets that are
 nothing to do with this -- colorshell publishes one -- so a name typed by hand
-can land on any of them."
-  (or (repl-greeting socket)
+can land on any of them.
+
+**THIRTY SECONDS, THOUGH, BECAUSE SIX HUNDRED MILLISECONDS WAS WRONG.**  A back
+door's prompt is written by the program's MAIN thread when it next polls the
+cooperative server -- not by the thread that accepts the connection -- so a
+shell that is running an expression, redrawing, or in a garbage collection says
+nothing until it is done.  This used to give up after 600 ms and report
+`repl scheme-desktop does not answer like a Guile back door' whenever the shell
+happened to be busy, which is a lie about a healthy program: `repl -e '(sleep 3)
+…'` in one terminal reproduces it on demand.  A note after a second says what is
+being waited for, so the wait does not look like a hang.  The LISTING (`repl -l')
+keeps the short one: it asks the question of every socket on the machine, and a
+busy shell is not its subject."
+  (or (repl-greeting socket
+                     #:tries 6000
+                     #:on-slow
+                     (lambda ()
+                       (format (current-error-port)
+                               "repl: ~a accepted the connection but has not answered; waiting for its main thread~%"
+                               name)))
       (begin (repl-close socket)
-             (die "~a does not answer like a Guile back door.~%  (try `repl' to see what does)"
+             (die "~a accepted the connection but sent no Guile prompt in 30s.~%  (a wedged program, or not a Guile back door -- `repl -l' lists what is there)"
                   name))))
 
 ;;; ---------------------------------------------------------------------------
